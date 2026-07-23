@@ -166,12 +166,3 @@ child_docs_only =  child_collection.similarity_search(
     "Cornwall Ranger")
 
 print("Child Collection Search Results:", child_docs_only[0])
-
-
-
-
-
-
-
-    
-  
