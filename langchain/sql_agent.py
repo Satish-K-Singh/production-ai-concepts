@@ -11,6 +11,7 @@ from typing import Any, Dict
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool
+from langchain.agents.middleware import ToolRetryMiddleware
 
 # Constant
 _DB_PATH = "Test.db"
@@ -91,10 +92,17 @@ def create_sql_agent() -> Any:
         An initialized LangChain agent.
     """
     tools = [sql_db_list_tables, sql_db_schema, sql_db_query]
+    retry_middleware = ToolRetryMiddleware(
+        max_retries=3,
+        backoff_factor=2.0,
+        initial_delay=1.0,
+        on_failure="continue",
+    )
     agent = create_agent(
         model_name=_MODEL_NAME,
         tools=tools,
         system_prompt=_SYSTEM_PROMPT,
+        middleware=[retry_middleware]
     )
     return agent
 
