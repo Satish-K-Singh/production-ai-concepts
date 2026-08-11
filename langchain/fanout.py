@@ -33,11 +33,9 @@ def research_topic(state: dict) -> dict:
         "durations": [elapsed],
     }
 
-
 def fan_out(state: ResearchState):
    
     return [Send("research_topic", {"topic": t}) for t in state["topics"]]
-
 
 def compile_report(state: ResearchState) -> dict:
     return {"final_report": "\n\n".join(state["summaries"])}
@@ -51,7 +49,6 @@ builder.add_edge("research_topic", "compile_report")
 builder.add_edge("compile_report", END)
 
 graph = builder.compile()
-
 
 def print_bar(done: int, total: int):
     width = 30
