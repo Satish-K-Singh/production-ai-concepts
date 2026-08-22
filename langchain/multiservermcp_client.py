@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import shutil
 import sys
@@ -10,42 +8,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
 DB_PATH = os.path.join(DATA_DIR, "shopease.db")
 
-
-def _sqlite_command() -> tuple[str, list[str]]:
+def _sqlite_command() ->tuple[str, list[str]]:
     """Resolve the SQLite MCP server command."""
-
     override = os.getenv("MCP_SQLITE_COMMAND")
     if override:
-        if not os.path.exists(override) and not shutil.which(override):
-            raise FileNotFoundError(
-                f"MCP_SQLITE_COMMAND could not be found: {override}"
-            )
-
+        if not os.path.exists(override):
+            raise FileNotFoundError(f"SQLite command override not found: {override}")
         return override, ["--db-path", DB_PATH]
 
     uvx_path = shutil.which("uvx")
     if uvx_path:
         return uvx_path, [
-            "mcp-server-sqlite",
-            "--db-path",
-            DB_PATH,
+             "mcp-server-sqlite",
+             "--db-path",
+                DB_PATH
         ]
-
     sqlite_path = shutil.which("mcp-server-sqlite")
     if sqlite_path:
-        return sqlite_path, [
-            "--db-path",
-            DB_PATH,
-        ]
-
-    # Run the installed Python module through the active virtual environment.
-    return sys.executable, [
-        "-m",
-        "mcp_server_sqlite",
-        "--db-path",
-        DB_PATH,
-    ]
-
+        return sqlite_path, ["--db-path", DB_PATH]
+    return sys.executable, ["-m", "langchain_mcp_adapters.server.sqlite", "--db-path", DB_PATH]
 
 def _filesystem_command() -> tuple[str, list[str]]:
     """Resolve the Filesystem MCP server command safely on Windows."""
@@ -73,7 +54,6 @@ def _filesystem_command() -> tuple[str, list[str]]:
         return cmd_path, ["/c", npx_path, *server_args]
 
     return npx_path, server_args
-
 
 def build_client() -> MultiServerMCPClient:
     """Create a client connected to SQLite and Filesystem MCP servers."""
