@@ -1,85 +1,83 @@
-from dotenv import load_dotenv
-load_dotenv()  # Load environment variables from .env file
-
 import operator
 import sqlite3
-from typing import Dict, Union, Annotated
+import uuid
+from typing import Annotated, Dict, Union
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
 from langchain_openai import ChatOpenAI
+from langchain_community.tools.tavily_search import TavilySearchResults
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send, interrupt, Command
-from langchain.agents import create_agent, Tool
-from langchain.agents.middleware import ToolRetryMiddleware
-from langchain_tavily import TavilySearch
+from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-model = ChatOpenAI(model_name="gpt-4", temperature=0.0, max_tokens=2000)
+load_dotenv()
 
-executor = create_agent(
-    model = model,
-    tools = [TavilySearch(max_results=3)],
-    system_prompt = "Execute exactly the one task given to you. Be concise and factual.",
-    middleware = [ToolRetryMiddleware(max_retries=3, backoff_factor=2, onfailure="continue")],
-)
+# Models & Tools
+model = ChatOpenAI(model_name="gpt-4o", temperature=0.0)
+tools = [TavilySearchResults(max_results=3)]
+executor = create_react_agent(model=model, tools=tools)
 
+# Pydantic Schemas
 class Step(BaseModel):
-    id : str = Field(description="Unique identifier for the step.")
-    task : str = Field(description="The task to be executed in this step.")
-    depends_on : list[str] = Field(default_factory=list, description="IDs of steps that must finish first.")
-    sensitive : bool = Field(default=False, description="True if this step needs human approval before running.")
+    id: str = Field(description="Unique identifier for the step.")
+    task: str = Field(description="The task to be executed in this step.")
+    depends_on: list[str] = Field(default_factory=list, description="IDs of steps that must finish first.")
+    sensitive: bool = Field(default=False, description="True if this step needs human approval before running.")
 
 class Plan(BaseModel):
     steps: list[Step]
 
-class Response(BaseModel):
-    response : str
-    confidence : float = Field(ge=0.0, le=1.0, description="0-1 confidence this fully answers the objective.")
-
 class Act(BaseModel):
-    action : Union[Response, Plan]
+    """Return either a final response or a new plan."""
+    response: str | None = Field(default=None, description="Final response answering the objective.")
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0, description="0-1 confidence score.")
+    steps: list[Step] | None = Field(default=None, description="Next planned steps if not yet finished.")
 
 planner_model = model.with_structured_output(Plan)
 replanner_model = model.with_structured_output(Act)
 
+# States
 class PlanExecuteState(TypedDict):
-    objective : str
-    plan : list[Dict]
-    completed_ids : Annotated[list[str], operator.add]
+    objective: str
+    plan: list[Dict]
+    completed_ids: Annotated[list[str], operator.add]
     past_steps: Annotated[list[tuple], operator.add]
-    respone : str
-    confidence : float
+    response: str
+    confidence: float
 
+class ExecuteStepState(TypedDict):
+    step: Dict
+
+# Graph Nodes
 def plan_step(state: PlanExecuteState) -> dict:
     plan = planner_model.invoke(
         f"Break this objective into an ordered set of concrete steps. "
         f"Mark depends_on for any step that needs another step's result first. "
         f"Mark sensitive=true only for steps involving irreversible or risky actions.\n\n"
         f"Objective: {state['objective']}"
-
     )
     return {"plan": [s.model_dump() for s in plan.steps]}
 
-def ready_steps(state : PlanExecuteState) -> list[Step]:
-    """Steps whose dependencies are all already completed, and not yet done."""
-    done= set(state["completed_ids"])
+def ready_steps(state: PlanExecuteState) -> list[dict]:
+    done = set(state.get("completed_ids", []))
     return [
-        s for s in state["plan"] if s["id"] not in done and set(s["depends_on"]).issubset(done)
+        s for s in state.get("plan", []) 
+        if s["id"] not in done and set(s.get("depends_on", [])).issubset(done)
     ]
 
-def fan_out_ready_steps(state : PlanExecuteState) -> list[dict]:
-    """Return a list of dicts, each with a single ready step to execute."""
+def fan_out_ready_steps(state: PlanExecuteState):
     steps = ready_steps(state)
-
     if not steps:
         return "replan"
-
     return [Send("execute_step", {"step": s}) for s in steps]
 
-def execute_step(state : PlanExecuteState, step : Step) -> dict:
+def execute_step(state: ExecuteStepState) -> dict:
     step = state["step"]
 
-    if step["sensitive"]:
+    if step.get("sensitive", False):
         decision = interrupt({
             "question": "Approve this sensitive step?",
             "step_id": step["id"],
@@ -87,21 +85,96 @@ def execute_step(state : PlanExecuteState, step : Step) -> dict:
         })
         if decision != "approve":
             return {
-                "completed_ids": state["completed_ids"],
-                "past_steps": [(step["task"], "SKIPPED — human did not approve this sensitive step.")], 
+                "completed_ids": [step["id"]],
+                "past_steps": [(step["task"], "SKIPPED — rejected by user.")],
             }
 
-        result = executor.invoke({"messages":[{"role": "user", "content": step["task"]}]})
-        output = result["messages"][-1].content
-        return {
-            "completed_ids": [step["id"]],
-            "past_steps": [(step["task"], output)],
-        }
-
+    result = executor.invoke({"messages": [{"role": "user", "content": step["task"]}]})
+    output = result["messages"][-1].content
+    return {
+        "completed_ids": [step["id"]],
+        "past_steps": [(step["task"], output)],
+    }
 
 def replan_step(state: PlanExecuteState) -> dict:
-    """Replan the remaining steps based on the current state."""
-    summary = "\n".join(f"{task} => {result}" for task, result in state["past_steps"])
-    remaining_steps = [s for s in state["plan"] if s["id"] not in state["completed_ids"]]
+    summary = "\n".join(f"{task} => {result}" for task, result in state.get("past_steps", []))
+    remaining_steps = [s for s in state.get("plan", []) if s["id"] not in state.get("completed_ids", [])]
 
-    
+    act: Act = replanner_model.invoke(
+        f"Objective: {state['objective']}\n\n"
+        f"Completed so far:\n{summary}\n\n"
+        f"Remaining planned steps: {remaining_steps}\n\n"
+        "If the objective is now fully satisfied, provide a final response and confidence score. "
+        "Otherwise provide the updated list of steps."
+    )
+
+    if act.response:
+        return {
+            "response": act.response,
+            "confidence": act.confidence or 1.0,
+        }
+
+    return {
+        "plan": [s.model_dump() for s in (act.steps or [])],
+    }
+
+def route_after_replan(state: PlanExecuteState):
+    if state.get("response"):
+        return END
+    return fan_out_ready_steps(state)
+
+# Graph Assembly
+builder = StateGraph(PlanExecuteState)
+builder.add_node("planner", plan_step)
+builder.add_node("execute_step", execute_step)
+builder.add_node("replan", replan_step)
+
+builder.add_edge(START, "planner")
+builder.add_conditional_edges("planner", fan_out_ready_steps, ["execute_step", "replan"])
+builder.add_edge("execute_step", "replan")
+builder.add_conditional_edges("replan", route_after_replan, ["execute_step", "replan", END])
+
+conn = sqlite3.connect("plan_checkpoints.sqlite", check_same_thread=False)
+graph = builder.compile(checkpointer=SqliteSaver(conn))
+
+# CLI Runner
+if __name__ == "__main__":
+    print("Advanced Plan-and-Execute Agent (type 'quit' to exit)\n")
+
+    while True:
+        objective = input("Enter an objective to achieve: ").strip()
+        if objective.lower() == "quit":
+            break
+        if not objective:
+            continue
+
+        thread_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 25}
+
+        result = graph.invoke({
+            "objective": objective,
+            "plan": [],
+            "completed_ids": [],
+            "past_steps": [],
+            "response": "",
+            "confidence": 0.0
+        }, config)
+
+        # Handle Human-in-the-loop interrupts
+        while "__interrupt__" in result:
+            payload = result["__interrupt__"][0].value
+            print(f"\n[APPROVAL NEEDED] Step '{payload['step_id']}': {payload['step_task']}")
+            answer = input("Type 'approve' or 'reject': ").strip().lower()
+            result = graph.invoke(Command(resume=answer), config)
+
+        print("\n" + "=" * 65)
+        print("STEPS TAKEN")
+        print("=" * 65)
+        for task, output in result.get("past_steps", []):
+            print(f"• {task}\n  → {output}\n")
+
+        print("=" * 65)
+        print(f"FINAL RESPONSE (confidence: {result.get('confidence', 0.0):.0%})")
+        print("=" * 65)
+        print(result.get("response"))
+        print("=" * 65 + "\n")
