@@ -67,3 +67,41 @@ def ready_steps(state : PlanExecuteState) -> list[Step]:
         s for s in state["plan"] if s["id"] not in done and set(s["depends_on"]).issubset(done)
     ]
 
+def fan_out_ready_steps(state : PlanExecuteState) -> list[dict]:
+    """Return a list of dicts, each with a single ready step to execute."""
+    steps = ready_steps(state)
+
+    if not steps:
+        return "replan"
+
+    return [Send("execute_step", {"step": s}) for s in steps]
+
+def execute_step(state : PlanExecuteState, step : Step) -> dict:
+    step = state["step"]
+
+    if step["sensitive"]:
+        decision = interrupt({
+            "question": "Approve this sensitive step?",
+            "step_id": step["id"],
+            "step_task": step["task"]
+        })
+        if decision != "approve":
+            return {
+                "completed_ids": state["completed_ids"],
+                "past_steps": [(step["task"], "SKIPPED — human did not approve this sensitive step.")], 
+            }
+
+        result = executor.invoke({"messages":[{"role": "user", "content": step["task"]}]})
+        output = result["messages"][-1].content
+        return {
+            "completed_ids": [step["id"]],
+            "past_steps": [(step["task"], output)],
+        }
+
+
+def replan_step(state: PlanExecuteState) -> dict:
+    """Replan the remaining steps based on the current state."""
+    summary = "\n".join(f"{task} => {result}" for task, result in state["past_steps"])
+    remaining_steps = [s for s in state["plan"] if s["id"] not in state["completed_ids"]]
+
+    
